@@ -15,8 +15,12 @@ from .schemas import (
     CancelRequest,
     LicenseCreate,
     LicenseOut,
+    OpeningCodeOut,
+    OpeningCodeStatusOut,
     PoolCreate,
     PoolOut,
+    RedeemRequest,
+    RedemptionOut,
     RevokeOut,
     RevokeRequest,
     SuspensionCreate,
@@ -66,8 +70,8 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     app = FastAPI(
         title="Film Festival Screening License Service",
-        version="1.2.0",
-        description="电影节片源放映许可核验：授权录入、限时暂停、幂等核验、额度控制、撤销追溯与已核准场次取消",
+        version="1.3.0",
+        description="电影节片源放映许可核验：授权录入、限时暂停、幂等核验、额度控制、撤销追溯、已核准场次取消与一次性开场码领取/核销",
         lifespan=lifespan,
     )
     app.state.store = store
@@ -83,7 +87,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     async def _not_found_handler(request: Request, exc: NotFoundError):
         return JSONResponse(
             status_code=404,
-            content={"detail": str(exc), "code": "NOT_FOUND"},
+            content={"detail": str(exc), "code": exc.code},
         )
 
     @app.exception_handler(UnprocessableError)
@@ -100,7 +104,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     def root():
         return {
             "service": "film-festival-licensing",
-            "version": "1.2.0",
+            "version": "1.3.0",
             "docs": "/docs",
             "health": "/health",
         }
@@ -288,6 +292,55 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
           同一键但取消原因不同返回 409。
         """
         return store.cancel_verification(idempotency_key, reason=body.reason)
+
+    # ------------------------------------------------------------------
+    # one-time opening codes (operator claim / status) and venue redemption
+    # ------------------------------------------------------------------
+    @app.post(
+        "/verifications/{idempotency_key}/opening-code",
+        response_model=OpeningCodeOut,
+        tags=["opening-codes"],
+    )
+    def claim_opening_code(idempotency_key: str):
+        """运营方按原核验幂等键为核准场次领取一次性开场码。
+
+        - 仅已核准（approved）、未取消且未到计划开场时刻的场次可领取；
+          未知键 404，已拒绝 422 VERIFICATION_NOT_APPROVED，已取消 422
+          SESSION_CANCELLED，已开场 422 SESSION_ALREADY_STARTED，均不产生码；
+        - 每场仅有一个码：首次领取返回原码（replay=false），重复领取只返回
+          状态（replay=true，code=null），原码不会再次泄露；
+        - 取消与领取并发时由写锁与唯一约束串行化：取消先到则领取失败，
+          领取先到则取消后该码状态立即变为 voided。
+        """
+        return store.claim_opening_code(idempotency_key)
+
+    @app.get(
+        "/verifications/{idempotency_key}/opening-code",
+        response_model=OpeningCodeStatusOut,
+        tags=["opening-codes"],
+    )
+    def get_opening_code_status(idempotency_key: str):
+        """查询开场码状态（not_issued/issued/redeemed/voided），不返回原码。"""
+        return store.get_opening_code_status(idempotency_key)
+
+    @app.post(
+        "/redemptions",
+        response_model=RedemptionOut,
+        tags=["opening-codes"],
+    )
+    def redeem_opening_code(body: RedeemRequest):
+        """场馆凭开场码及场馆编号在计划开场时刻起 30 分钟内核销。
+
+        - 窗口为左闭右开 ``[start_time, start_time+30min)``：过早 422
+          REDEMPTION_TOO_EARLY，过期 422 REDEMPTION_WINDOW_CLOSED；场馆不符
+          422 VENUE_MISMATCH；场次已取消 422 SESSION_CANCELLED；未知码 404
+          OPENING_CODE_NOT_FOUND；一切拒绝都不产生回执；
+        - 成功一次后重复核销返回首次回执（replay=true，即使已过窗口），
+          不重复记场次；错场馆重试一律 VENUE_MISMATCH（含已核销码）；
+        - 核销不重新校验授权：此后授权撤销或暂停不改变已核准场次的核销
+          资格，也不改变原核验结果与额度/池占用。
+        """
+        return store.redeem_opening_code(code=body.code, venue_id=body.venue_id)
 
     return app
 

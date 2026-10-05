@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -196,3 +196,65 @@ class CancelOut(BaseModel):
     replay: bool = Field(
         description="true 表示重复提交同一取消，返回首次记录，未重复释放额度"
     )
+
+
+# ----------------------------------------------------------------------
+# 一次性开场码领取 / 状态查询 / 场馆核销
+# ----------------------------------------------------------------------
+class OpeningCodeStatusOut(BaseModel):
+    """开场码状态；除首次领取外任何途径都不回传原码。"""
+
+    idempotency_key: str = Field(description="原核验幂等键")
+    status: Literal["not_issued", "issued", "redeemed", "voided"] = Field(
+        description=(
+            "not_issued=尚未领取；issued=已领取未核销；"
+            "redeemed=已核销（附回执）；voided=场次取消后立即失效"
+        )
+    )
+    issued_at: Optional[str] = Field(description="首次领取时间（UTC）；尚未领取为 null")
+    cancelled_at: Optional[str] = Field(
+        description="场次取消时间（UTC），status=voided 时非空"
+    )
+    redemption: Optional["RedemptionOut"] = Field(
+        default=None, description="已核销时附首次核销回执，否则为 null"
+    )
+
+
+class OpeningCodeOut(OpeningCodeStatusOut):
+    """领取响应：首次领取（replay=false）回传一次性码，重复领取仅回状态。"""
+
+    code: Optional[str] = Field(
+        description="一次性开场码；仅首次领取（replay=false）返回，重复领取为 null"
+    )
+    replay: bool = Field(
+        description="true 表示重复领取，只回状态，原码不会再次泄露"
+    )
+
+
+class RedeemRequest(BaseModel):
+    code: str = Field(min_length=1, max_length=64, examples=["OC-3f9a..."])
+    venue_id: str = Field(min_length=1, max_length=128, examples=["hall-1"])
+
+    @field_validator("code", "venue_id")
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be blank")
+        return value
+
+
+class RedemptionOut(BaseModel):
+    """核销回执；成功一次后重复核销始终返回首次回执（replay=true）。"""
+
+    id: int = Field(description="回执编号")
+    idempotency_key: str = Field(description="被核销场次的原核验幂等键")
+    film_id: str = Field(description="场次影片")
+    venue_id: str = Field(description="核销场馆编号（与核准场馆一致）")
+    start_time: str = Field(description="计划开场时刻（UTC）")
+    license_id: int = Field(description="关联授权 id")
+    pool_id: Optional[int] = Field(description="关联共享池 id；授权未绑池为 null")
+    redeemed_at: str = Field(description="实际核销时间（UTC）")
+    replay: bool = Field(description="true 表示重复核销返回首次回执，不重复记场次")
+
+
+OpeningCodeStatusOut.model_rebuild()

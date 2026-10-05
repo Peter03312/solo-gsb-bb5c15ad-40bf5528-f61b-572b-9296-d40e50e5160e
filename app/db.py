@@ -76,6 +76,26 @@ CREATE TABLE IF NOT EXISTS cancellations (
 -- 每条核验流水至多一条取消记录：唯一约束在并发取消时兜底，额度不会重复释放
 CREATE UNIQUE INDEX IF NOT EXISTS idx_cancellations_key
     ON cancellations (idempotency_key);
+
+-- 一次性开场码：运营方按原核验幂等键为核准场次领取；每场至多一个码，
+-- verification_id 唯一约束兜底并发领取；取消登记后该码状态立即失效（voided），
+-- 不删行，保留可追溯的领取记录。
+CREATE TABLE IF NOT EXISTS opening_codes (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    verification_id INTEGER NOT NULL UNIQUE REFERENCES verifications (id),
+    idempotency_key TEXT    NOT NULL UNIQUE,
+    code            TEXT    NOT NULL UNIQUE,      -- 随机一次性码，仅首次领取返回
+    issued_at       TEXT    NOT NULL
+);
+
+-- 核销回执：场馆在计划开场时刻起 30 分钟内核销成功后产生；
+-- opening_code_id 唯一约束保证同一码至多一条回执，重复核销返回首次回执。
+CREATE TABLE IF NOT EXISTS redemptions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    opening_code_id INTEGER NOT NULL UNIQUE REFERENCES opening_codes (id),
+    venue_id        TEXT    NOT NULL,             -- 核销场馆编号（须与核准场馆一致）
+    redeemed_at     TEXT    NOT NULL
+);
 """
 
 # Columns added after the initial release; applied lazily so databases
