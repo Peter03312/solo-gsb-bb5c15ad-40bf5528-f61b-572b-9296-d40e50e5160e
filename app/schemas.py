@@ -196,3 +196,42 @@ class CancelOut(BaseModel):
     replay: bool = Field(
         description="true 表示重复提交同一取消，返回首次记录，未重复释放额度"
     )
+
+
+class OpeningCodeOut(BaseModel):
+    idempotency_key: str = Field(description="原核验幂等键")
+    verification_id: int = Field(description="对应核验流水 id")
+    film_id: str
+    venue_id: str = Field(description="核准场次的场馆编号；核销场馆必须与之相同")
+    start_time: str = Field(description="计划开场时刻（UTC）；核销窗口为其后 30 分钟")
+    window_open_at: str = Field(description="核销窗口开启时间（=计划开场时刻，UTC）")
+    window_close_at: str = Field(description="核销窗口关闭时间（计划开场 +30 分钟，含，UTC）")
+    status: str = Field(
+        description="issued（已领取待核销）/ redeemed（已核销）/ void（场次取消，码已作废）"
+    )
+    code: Optional[str] = Field(
+        description="一次性开场码原码；仅首次领取返回，重复领取与查询为 null"
+    )
+    issued_at: str = Field(description="首次领取时间（UTC）")
+    redeemed_at: Optional[str] = Field(description="实际核销时间（UTC）；未核销为 null")
+    replay: bool = Field(description="true 表示重复领取，仅回状态、不回原码")
+
+
+class RedeemRequest(BaseModel):
+    code: str = Field(min_length=1, max_length=128, examples=["OC-9f8c2a1b7e4d4f60a3b5c7d9e2f1a0b3"])
+    venue_id: str = Field(min_length=1, max_length=128, examples=["hall-1"])
+
+
+class RedemptionOut(BaseModel):
+    id: int = Field(description="核销回执编号")
+    idempotency_key: str = Field(description="场次原核验幂等键")
+    verification_id: int = Field(description="对应核验流水 id")
+    film_id: str
+    venue_id: str = Field(description="实际核销场馆（等于场次核准场馆）")
+    start_time: str = Field(description="计划开场时刻（UTC）")
+    redeemed_at: str = Field(description="实际核销时间（UTC）")
+    license_id: int = Field(description="关联授权 id（原核验命中的授权）")
+    pool_id: Optional[int] = Field(description="关联共享池 id；授权未绑池为 null")
+    replay: bool = Field(
+        description="true 表示同一码重试核销，返回首次回执，不重复记场次"
+    )

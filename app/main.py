@@ -15,8 +15,11 @@ from .schemas import (
     CancelRequest,
     LicenseCreate,
     LicenseOut,
+    OpeningCodeOut,
     PoolCreate,
     PoolOut,
+    RedeemRequest,
+    RedemptionOut,
     RevokeOut,
     RevokeRequest,
     SuspensionCreate,
@@ -66,8 +69,8 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     app = FastAPI(
         title="Film Festival Screening License Service",
-        version="1.2.0",
-        description="电影节片源放映许可核验：授权录入、限时暂停、幂等核验、额度控制、撤销追溯与已核准场次取消",
+        version="1.3.0",
+        description="电影节片源放映许可核验：授权录入、限时暂停、幂等核验、额度控制、撤销追溯、已核准场次取消与一次性开场码领取/核销",
         lifespan=lifespan,
     )
     app.state.store = store
@@ -100,7 +103,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     def root():
         return {
             "service": "film-festival-licensing",
-            "version": "1.2.0",
+            "version": "1.3.0",
             "docs": "/docs",
             "health": "/health",
         }
@@ -288,6 +291,54 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
           同一键但取消原因不同返回 409。
         """
         return store.cancel_verification(idempotency_key, reason=body.reason)
+
+    # ------------------------------------------------------------------
+    # one-time opening codes (operator claim/status, venue redemption)
+    # ------------------------------------------------------------------
+    @app.post(
+        "/verifications/{idempotency_key}/opening-code",
+        response_model=OpeningCodeOut,
+        tags=["opening-codes"],
+    )
+    def claim_opening_code(idempotency_key: str):
+        """为已核准、未取消且尚未开场的场次领取一次性开场码（每场一个）。
+
+        - 首次领取生成并返回开场码原码（``code``）；重复领取只回状态，
+          ``replay=true`` 且 ``code=null``，原码不会再泄露；
+        - 未知核验键 404；已拒绝流水 422 ``VERIFICATION_NOT_APPROVED``；
+          已取消 422 ``SCREENING_CANCELLED``；已开场 422
+          ``SESSION_ALREADY_STARTED``；
+        - 并发领取与取消/核销在写事务内串行：一场至多一个码；取消成功后
+          未核销的码立即作废（状态 ``void``）。
+        """
+        return store.claim_opening_code(idempotency_key)
+
+    @app.get(
+        "/verifications/{idempotency_key}/opening-code",
+        response_model=OpeningCodeOut,
+        tags=["opening-codes"],
+    )
+    def get_opening_code(idempotency_key: str):
+        """查询开场码状态（issued/redeemed/void）；任何情况下都不返回原码。"""
+        return store.get_opening_code(idempotency_key)
+
+    @app.post(
+        "/opening-codes/redeem",
+        response_model=RedemptionOut,
+        tags=["opening-codes"],
+    )
+    def redeem_opening_code(body: RedeemRequest):
+        """场馆凭开场码与场馆编号，在计划开场时刻起 30 分钟内核销（含两端）。
+
+        - 返回场次（影片/场馆/计划开始时间）、实际核销时间与关联授权/池；
+        - 过早 422 ``REDEMPTION_NOT_OPEN``、过期 422
+          ``REDEMPTION_WINDOW_CLOSED``、场馆不符 422 ``VENUE_MISMATCH``、
+          未知码 404、已取消 422 ``SCREENING_CANCELLED``，均拒绝且不产生回执；
+        - 成功后重试返回首次回执（``replay=true``），即使已过窗口也不重复
+          记场次；核销不改变原核验结果、剩余额度快照与授权/池占用；授权
+          此后被撤销或暂停不影响本场核销资格。
+        """
+        return store.redeem_opening_code(code=body.code, venue_id=body.venue_id)
 
     return app
 

@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Iterator, Optional
 
 from .db import connect, init_schema
-from .timeutil import now_iso, to_iso
+from .timeutil import now_iso, parse_iso, to_iso
 
 DECISION_APPROVED = "approved"
 DECISION_REJECTED = "rejected"
@@ -22,6 +23,14 @@ REASON_LICENSE_REVOKED = "LICENSE_REVOKED"   # 覆盖该时段的授权均已撤
 REASON_LICENSE_SUSPENDED = "LICENSE_SUSPENDED"  # 覆盖该时段且未撤销的授权全部处于暂停中
 REASON_QUOTA_EXHAUSTED = "QUOTA_EXHAUSTED"   # 授权有效但场次额度已用完
 REASON_POOL_EXHAUSTED = "POOL_EXHAUSTED"     # 授权自身有余额，但所绑影片级共享池已耗尽
+
+# 开场码核销窗口：自计划开场时刻起 30 分钟（两端均含）。
+REDEMPTION_WINDOW = timedelta(minutes=30)
+
+# 开场码生命周期状态（由关联表派生，不单独存列）：
+CODE_STATUS_ISSUED = "issued"      # 已领取、未取消、未核销
+CODE_STATUS_REDEEMED = "redeemed"  # 已核销（一旦核销终态，重放返回首次回执）
+CODE_STATUS_VOID = "void"          # 场次已取消，码立即失效
 
 # 已取消的核准流水不再占用授权/池额度：取消登记后实时已用次数回退，
 # 释放出的额度可被后续核验使用；原核验行及其快照保持原样。
@@ -230,6 +239,89 @@ def _cancel_out(cancel_row: sqlite3.Row, verification_row: sqlite3.Row,
         "pool_id": verification_row["pool_id"],
         "reason": cancel_row["reason"],
         "cancelled_at": cancel_row["cancelled_at"],
+        "replay": replay,
+    }
+
+
+def _hash_code(code: str) -> str:
+    return hashlib.sha256(code.encode("utf-8")).hexdigest()
+
+
+def _new_opening_code() -> tuple[str, str]:
+    """Generate a one-time opening code and its stored hash.
+
+    The plaintext is returned exactly once (on first claim); only the
+    SHA-256 hash is persisted, so queries/DB dumps can never leak it.
+    """
+    code = "OC-" + secrets.token_hex(16)
+    return code, _hash_code(code)
+
+
+def _opening_code_status(row: sqlite3.Row) -> str:
+    """Derive the lifecycle status from joined redemption/cancellation rows."""
+    if row["redeemed_at"] is not None:
+        return CODE_STATUS_REDEEMED
+    if row["cancel_id"] is not None:
+        return CODE_STATUS_VOID
+    return CODE_STATUS_ISSUED
+
+
+# 开场码查询统一左联核销回执与取消记录：状态完全由关联行派生，领取、取消、
+# 核销在同一写事务内看到的状态与提交顺序严格一致。
+_OPENING_CODE_SELECT = """
+SELECT
+    oc.id,
+    oc.verification_id,
+    oc.idempotency_key,
+    oc.created_at AS issued_at,
+    v.film_id,
+    v.venue_id,
+    v.start_time,
+    v.license_id,
+    v.pool_id,
+    r.redeemed_at   AS redeemed_at,
+    c.id            AS cancel_id,
+    c.reason        AS cancel_reason,
+    c.cancelled_at  AS cancelled_at
+FROM opening_codes oc
+JOIN verifications v ON v.id = oc.verification_id
+LEFT JOIN code_redemptions r ON r.opening_code_id = oc.id
+LEFT JOIN cancellations c ON c.verification_id = v.id
+"""
+
+
+def _opening_code_out(row: sqlite3.Row, *, replay: bool,
+                      code: Optional[str] = None) -> dict:
+    start = parse_iso(row["start_time"])
+    return {
+        "idempotency_key": row["idempotency_key"],
+        "verification_id": row["verification_id"],
+        "film_id": row["film_id"],
+        "venue_id": row["venue_id"],
+        "start_time": row["start_time"],
+        "window_open_at": to_iso(start),
+        "window_close_at": to_iso(start + REDEMPTION_WINDOW),
+        "status": _opening_code_status(row),
+        "code": code,
+        "issued_at": row["issued_at"],
+        "redeemed_at": row["redeemed_at"],
+        "replay": replay,
+    }
+
+
+def _redemption_out(redemption_row: sqlite3.Row,
+                    opening_row: sqlite3.Row, *, replay: bool) -> dict:
+    """The single receipt of a successful redemption."""
+    return {
+        "id": redemption_row["id"],
+        "idempotency_key": opening_row["idempotency_key"],
+        "verification_id": redemption_row["verification_id"],
+        "film_id": opening_row["film_id"],
+        "venue_id": redemption_row["venue_id"],
+        "start_time": opening_row["start_time"],
+        "redeemed_at": redemption_row["redeemed_at"],
+        "license_id": opening_row["license_id"],
+        "pool_id": opening_row["pool_id"],
         "replay": replay,
     }
 
@@ -812,6 +904,227 @@ class Store:
                     "replay": False,
                 }
             except (NotFoundError, ConflictError, UnprocessableError):
+                raise
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+
+    # ------------------------------------------------------------------
+    # one-time opening codes (claim / status / venue redemption)
+    # ------------------------------------------------------------------
+    def claim_opening_code(self, idempotency_key: str) -> dict:
+        """Issue the one-time opening code for an approved, live session.
+
+        Eligibility mirrors the cancellation preconditions plus "not yet
+        cancelled": the verification must exist, be ``approved``, have no
+        cancellation row, and the planned start time must still be in the
+        future.  Exactly one code exists per verification: the first call
+        mints it (plaintext returned once), every later call returns the
+        persisted status without the code.  The lookup/check/insert runs in
+        one ``BEGIN IMMEDIATE`` transaction serialised against cancellation
+        and redemption, and ``UNIQUE(verification_id)`` is the final guard
+        for the one-code guarantee under concurrent claims.
+        """
+        with self._connection() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                existing = conn.execute(
+                    _OPENING_CODE_SELECT + " WHERE oc.idempotency_key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if existing is not None:
+                    conn.execute("COMMIT")
+                    return _opening_code_out(existing, replay=True)
+
+                verification = conn.execute(
+                    "SELECT * FROM verifications WHERE idempotency_key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if verification is None:
+                    conn.execute("ROLLBACK")
+                    raise NotFoundError(
+                        f"verification '{idempotency_key}' not found"
+                    )
+                if verification["decision"] != DECISION_APPROVED:
+                    conn.execute("ROLLBACK")
+                    raise UnprocessableError(
+                        f"verification '{idempotency_key}' was rejected and "
+                        "no opening code can be issued for it",
+                        code="VERIFICATION_NOT_APPROVED",
+                    )
+                if conn.execute(
+                    "SELECT 1 FROM cancellations WHERE verification_id = ?",
+                    (verification["id"],),
+                ).fetchone() is not None:
+                    conn.execute("ROLLBACK")
+                    raise UnprocessableError(
+                        f"screening '{idempotency_key}' has been cancelled; "
+                        "its opening code cannot be issued",
+                        code="SCREENING_CANCELLED",
+                    )
+                # 已开场（含恰在此刻）不再发放开场码，与取消的时间边界一致
+                if verification["start_time"] <= now_iso():
+                    conn.execute("ROLLBACK")
+                    raise UnprocessableError(
+                        f"screening '{idempotency_key}' has already started; "
+                        "its opening code can no longer be issued",
+                        code="SESSION_ALREADY_STARTED",
+                    )
+
+                issued_at = now_iso()
+                # 哈希冲突在实践中不可能；重试以稳妥应对 code_hash 唯一约束兜底。
+                while True:
+                    code, code_hash = _new_opening_code()
+                    try:
+                        cur = conn.execute(
+                            """
+                            INSERT INTO opening_codes
+                                (verification_id, idempotency_key,
+                                 code_hash, created_at)
+                            VALUES (?, ?, ?, ?)
+                            """,
+                            (verification["id"], idempotency_key,
+                             code_hash, issued_at),
+                        )
+                        break
+                    except sqlite3.IntegrityError:
+                        clash = conn.execute(
+                            "SELECT 1 FROM opening_codes WHERE code_hash = ?",
+                            (code_hash,),
+                        ).fetchone()
+                        if clash is not None:
+                            continue
+                        raise
+                row = conn.execute(
+                    _OPENING_CODE_SELECT + " WHERE oc.id = ?", (cur.lastrowid,)
+                ).fetchone()
+                conn.execute("COMMIT")
+                return _opening_code_out(row, replay=False, code=code)
+            except (NotFoundError, UnprocessableError):
+                raise
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+
+    def get_opening_code(self, idempotency_key: str) -> dict:
+        """Return the opening-code status for a key; the plaintext never."""
+        with self._connection() as conn:
+            row = conn.execute(
+                _OPENING_CODE_SELECT + " WHERE oc.idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError(
+                f"opening code for verification '{idempotency_key}' not found"
+            )
+        return _opening_code_out(row, replay=False)
+
+    def redeem_opening_code(self, *, code: str, venue_id: str) -> dict:
+        """Redeem a one-time opening code at the venue door.
+
+        The code is looked up by its SHA-256 hash.  Unknown codes, codes of
+        cancelled sessions, requests before the planned start or after
+        start + 30 minutes (both endpoints inclusive), and requests from a
+        venue other than the session's venue are all rejected **without**
+        creating a receipt.  A successful redemption is terminal: retries
+        return the first receipt (``replay=True``) regardless of the window
+        and a session is never counted twice.  Later revocation or
+        suspension of the license never invalidates an already-approved
+        session — eligibility is based solely on the stored verification
+        and cancellation rows, and redemption never touches quotas or the
+        original verification.
+        """
+        code_hash = _hash_code(code)
+        with self._connection() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                opening_code = conn.execute(
+                    "SELECT * FROM opening_codes WHERE code_hash = ?",
+                    (code_hash,),
+                ).fetchone()
+                if opening_code is None:
+                    conn.execute("ROLLBACK")
+                    raise NotFoundError("unknown opening code")
+
+                existing = conn.execute(
+                    "SELECT * FROM code_redemptions WHERE opening_code_id = ?",
+                    (opening_code["id"],),
+                ).fetchone()
+                if existing is not None:
+                    opening = conn.execute(
+                        _OPENING_CODE_SELECT + " WHERE oc.id = ?",
+                        (opening_code["id"],),
+                    ).fetchone()
+                    conn.execute("COMMIT")
+                    return _redemption_out(existing, opening, replay=True)
+
+                verification = conn.execute(
+                    "SELECT * FROM verifications WHERE id = ?",
+                    (opening_code["verification_id"],),
+                ).fetchone()
+
+                # 取消成功立即作废：未核销的码在此拒绝，且不产生回执
+                if conn.execute(
+                    "SELECT 1 FROM cancellations WHERE verification_id = ?",
+                    (verification["id"],),
+                ).fetchone() is not None:
+                    conn.execute("ROLLBACK")
+                    raise UnprocessableError(
+                        "the screening has been cancelled and its opening "
+                        "code is void",
+                        code="SCREENING_CANCELLED",
+                    )
+
+                now = now_iso()
+                start_iso = verification["start_time"]
+                close_iso = to_iso(parse_iso(start_iso) + REDEMPTION_WINDOW)
+                if now < start_iso:
+                    conn.execute("ROLLBACK")
+                    raise UnprocessableError(
+                        "redemption is not open before the planned start time",
+                        code="REDEMPTION_NOT_OPEN",
+                    )
+                if now > close_iso:
+                    conn.execute("ROLLBACK")
+                    raise UnprocessableError(
+                        "the 30-minute redemption window has closed",
+                        code="REDEMPTION_WINDOW_CLOSED",
+                    )
+                if verification["venue_id"] != venue_id:
+                    conn.execute("ROLLBACK")
+                    raise UnprocessableError(
+                        f"venue '{venue_id}' does not match the screening "
+                        f"venue '{verification['venue_id']}'",
+                        code="VENUE_MISMATCH",
+                    )
+
+                redeemed_at = now
+                cur = conn.execute(
+                    """
+                    INSERT INTO code_redemptions
+                        (opening_code_id, verification_id, venue_id, redeemed_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (opening_code["id"], verification["id"],
+                     venue_id, redeemed_at),
+                )
+                receipt = conn.execute(
+                    "SELECT * FROM code_redemptions WHERE id = ?",
+                    (cur.lastrowid,),
+                ).fetchone()
+                opening = conn.execute(
+                    _OPENING_CODE_SELECT + " WHERE oc.id = ?",
+                    (opening_code["id"],),
+                ).fetchone()
+                conn.execute("COMMIT")
+                return _redemption_out(receipt, opening, replay=False)
+            except (NotFoundError, UnprocessableError):
                 raise
             except Exception:
                 try:
